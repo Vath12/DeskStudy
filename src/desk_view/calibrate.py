@@ -14,6 +14,7 @@ from .board import BoardDetector, Detection
 from .geometry import Calibration, Viewport, fit_viewport
 
 SQUARE_COLOR = (40, 40, 230)  # BGR red
+MARKER_COLOR = (230, 120, 30)  # BGR blue
 COVERAGE_COLOR = np.array([0, 160, 0])
 
 
@@ -46,14 +47,40 @@ class DeskPose:
 
 
 def draw_squares(img: np.ndarray, detector: BoardDetector, det: Detection) -> None:
-    """Paint the chart's detected black squares red."""
-    outlines = detector.square_outlines(det)
-    if not outlines:
+    """Paint the chart's detected black squares red and cover its markers in solid blue.
+
+    Covering the markers matters: this image is shown on screen, and if the camera can see
+    the screen, an on-screen copy of readable markers would be detected as a second chart.
+    """
+    squares = detector.square_outlines(det, black=True)
+    markers = detector.square_outlines(det, black=False)
+    if not squares and not markers:
         return
+    poly = lambda outlines: [np.round(o * 16).astype(np.int32) for o in outlines]
     overlay = img.copy()
-    cv2.fillPoly(overlay, [np.round(o * 16).astype(np.int32) for o in outlines],
-                 SQUARE_COLOR, cv2.LINE_AA, shift=4)
+    cv2.fillPoly(overlay, poly(squares), SQUARE_COLOR, cv2.LINE_AA, shift=4)
     cv2.addWeighted(overlay, 0.75, img, 0.25, 0, dst=img)
+    cv2.fillPoly(img, poly(markers), MARKER_COLOR, cv2.LINE_AA, shift=4)
+
+
+class _HeldDetection:
+    """Keeps showing the last detection through a few dropped frames, so the overlay
+    doesn't flicker when a single frame fails (motion blur, a hand passing over)."""
+
+    HOLD_FRAMES = 3
+
+    def __init__(self):
+        self.last: Detection | None = None
+        self.age = 0
+
+    def update(self, det: Detection | None) -> Detection | None:
+        if det is not None:
+            self.last, self.age = det, 0
+        elif self.last is not None:
+            self.age += 1
+            if self.age > self.HOLD_FRAMES:
+                self.last = None
+        return self.last
 
 
 def _gray(frame):
@@ -89,6 +116,7 @@ class LensStep:
         self._last_capture = 0.0
         self._force = False
         self._flash = 0
+        self._shown = _HeldDetection()
 
     @property
     def count(self) -> int:
@@ -107,11 +135,13 @@ class LensStep:
         mask = self.coverage > 0
         vis[mask] = (0.6 * vis[mask] + 0.4 * COVERAGE_COLOR).astype(np.uint8)
 
+        shown = self._shown.update(det)
+        if shown is not None:
+            draw_squares(vis, self.detector, shown)
         capture = False
         if det is None:
             self.status = "Chart not found."
         else:
-            draw_squares(vis, self.detector, det)
             enough = len(det.ids) >= self.min_corners
             f = _pose_feature(det, self.size)
             novel = all(np.linalg.norm(f - g) > 0.06 for g in self.feats)
@@ -185,6 +215,8 @@ class DeskStep:
         self._got = 0
         self._prev: dict[int, np.ndarray] = {}
         self._still = 0
+        self._missed = 0
+        self._shown = _HeldDetection()
         self._started = time.time()
         self._armed = False
 
@@ -196,10 +228,15 @@ class DeskStep:
         self._locking_since = time.time()
         self._seen, self._got, self.error = {}, 0, None
 
+    MAX_DROPOUT = 3  # missed frames tolerated without restarting the stillness count
+
     def _track_stillness(self, det: Detection | None) -> None:
         if det is None or len(det.ids) < max(6, self.detector.num_corners // 3):
-            self._prev, self._still = {}, 0
+            self._missed += 1
+            if self._missed > self.MAX_DROPOUT:
+                self._prev, self._still = {}, 0
             return
+        self._missed = 0
         current = {int(i): c for i, c in zip(det.ids, det.corners)}
         common = current.keys() & self._prev.keys()
         moved = (np.median([np.linalg.norm(current[i] - self._prev[i]) for i in common])
@@ -210,8 +247,9 @@ class DeskStep:
     def process(self, frame: np.ndarray) -> np.ndarray:
         det = self.detector.detect(_gray(frame))
         vis = frame.copy()
-        if det is not None:
-            draw_squares(vis, self.detector, det)
+        shown = self._shown.update(det)
+        if shown is not None:
+            draw_squares(vis, self.detector, shown)
         if not self.locking:
             self._track_stillness(det)
             self._armed = self._armed or det is None or time.time() - self._started > self.ARM_AFTER_S
@@ -256,20 +294,26 @@ def solve_desk_pose(corners, ids, detector: BoardDetector, size,
     if intrinsics is not None:
         K, dist, method = intrinsics.camera_matrix, intrinsics.dist_coeffs, "multi-view"
     else:
-        # One oblique view of a plane pins down the focal length well, given a centred
-        # principal point and no distortion.
-        K0 = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], np.float64)
-        flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT
-                 | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_ZERO_TANGENT_DIST
-                 | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
-        try:
-            _, K, dist, _, _ = cv2.calibrateCamera([obj], [corners], size, K0, np.zeros(5), flags=flags)
-            if not 0.25 * w < K[0, 0] < 6 * w:
-                raise cv2.error("implausible focal length")
-        except cv2.error:
-            K, dist = K0, np.zeros(5)
-        dist = dist.ravel()
-        method = "single-view"
+        # A typical webcam/phone focal length (about 65° across), used when it can't be measured.
+        K0 = np.array([[0.8 * w, 0, w / 2], [0, 0.8 * w, h / 2], [0, 0, 1]], np.float64)
+        dist = np.zeros(5)
+        # One oblique view of a plane pins down the focal length well (given a centred
+        # principal point and no distortion); a chart seen nearly face-on does not, as its
+        # image then looks the same at any focal length. Overhead cameras hit this case.
+        ok, rvec0, _ = cv2.solvePnP(obj, corners, K0, dist, flags=cv2.SOLVEPNP_IPPE)
+        tilt = np.degrees(np.arccos(min(1.0, abs(cv2.Rodrigues(rvec0)[0][2, 2])))) if ok else 0.0
+        K, method = K0, "assumed"
+        if tilt >= 25:
+            flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT
+                     | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_ZERO_TANGENT_DIST
+                     | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
+            try:
+                # calibrateCamera writes into the matrix it is given, so pass a copy.
+                _, K1, _, _, _ = cv2.calibrateCamera([obj], [corners], size, K0.copy(), np.zeros(5), flags=flags)
+                if 0.25 * w < K1[0, 0] < 6 * w:
+                    K, method = K1, "single-view"
+            except cv2.error:
+                pass
 
     ok, rvec, tvec = cv2.solvePnP(obj, corners, K, dist, flags=cv2.SOLVEPNP_IPPE)
     if not ok:
@@ -312,7 +356,12 @@ def build_calibration(pose: DeskPose, detector: BoardDetector, size, out_size,
 def summary(calib: Calibration) -> str:
     s = calib.stats
     fov = np.degrees(2 * np.arctan(calib.image_size[0] / 2 / calib.camera_matrix[0, 0]))
+    fit = f"desk fit {s.get('desk_rms_mm', 0):.2f} mm"
+    height = abs(calib.camera_position()[2]) / 10
+    if calib.intrinsics_method == "assumed":
+        return (f"Calibrated: {fit}. The camera faces the desk almost straight on, so its focal length "
+                f"can't be measured from the desk alone (assumed ~{fov:.0f}°, camera ~{height:.0f} cm up); "
+                "the lens step removes lens distortion for best accuracy.")
     lens = (f"lens from {s['intrinsics_views']} views ({s['intrinsics_rms_px']:.2f} px)"
             if "intrinsics_rms_px" in s else "lens estimated from desk view")
-    return (f"Calibrated: {lens}, {fov:.0f}° horizontal FOV, desk fit {s.get('desk_rms_mm', 0):.2f} mm, "
-            f"camera {abs(calib.camera_position()[2]) / 10:.0f} cm above the desk.")
+    return f"Calibrated: {lens}, {fov:.0f}° horizontal FOV, {fit}, camera {height:.0f} cm above the desk."

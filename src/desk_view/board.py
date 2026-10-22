@@ -61,18 +61,33 @@ class BoardDetector:
         params.polygonalApproxAccuracyRate = 0.05
         params.perspectiveRemovePixelPerCell = 8
         charuco = cv2.aruco.CharucoParameters()
-        charuco.tryRefineMarkers = True  # recover missed markers from the known layout
         charuco.minMarkers = 1
         self.detector = cv2.aruco.CharucoDetector(
             self.board, charuco, params, cv2.aruco.RefineParameters()
         )
+        self.markers = cv2.aruco.ArucoDetector(self.board.getDictionary(), params, cv2.aruco.RefineParameters())
+        # Board-plane corners (mm) of every marker, by id.
+        self._marker_obj = {int(i): np.asarray(c, np.float32).reshape(4, 3)[:, :2]
+                            for i, c in zip(self.board.getIds().ravel(), self.board.getObjPoints())}
 
     @property
     def num_corners(self) -> int:
         return len(self._all_object_points)
 
     def detect(self, gray: np.ndarray) -> Detection | None:
-        corners, ids, _, _ = self.detector.detectBoard(gray)
+        # Light denoising: webcam/phone streams are noisy and compressed, and that noise
+        # flips the bits of small markers from frame to frame.
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        m_corners, m_ids, rejected = self.markers.detectMarkers(gray)
+        if m_ids is None:
+            return None
+        m_corners, m_ids = self._consistent_markers(m_corners, m_ids.ravel())
+        if len(m_ids) == 0:
+            return None
+        # Recover markers missed at first, now that the real ones pin down the layout.
+        m_corners, m_ids, _, _ = self.markers.refineDetectedMarkers(
+            gray, self.board, m_corners, m_ids.reshape(-1, 1), rejected)
+        corners, ids, _, _ = self.detector.detectBoard(gray, markerCorners=m_corners, markerIds=m_ids)
         if ids is None or len(ids) < self.min_corners:
             return None
         ids = ids.ravel()
@@ -82,11 +97,37 @@ class BoardDetector:
             object_points=self._all_object_points[ids],
         )
 
+    def _consistent_markers(self, corners, ids: np.ndarray):
+        """Drop markers that don't fit the board layout.
+
+        Things like keyboard keys sometimes decode as one of the board's marker ids; one such
+        impostor is enough to wreck the corner interpolation. Real markers all lie on one
+        plane, so a RANSAC homography from board to image separates them from impostors.
+        """
+        keep = [k for k, i in enumerate(ids) if int(i) in self._marker_obj]
+        if len(keep) >= 4:
+            img = np.concatenate([corners[k].reshape(4, 2) for k in keep])
+            obj = np.concatenate([self._marker_obj[int(ids[k])] for k in keep])
+            sides = [np.linalg.norm(np.diff(corners[k].reshape(4, 2), axis=0, append=corners[k].reshape(4, 2)[:1]), axis=1).mean()
+                     for k in keep]
+            H, mask = cv2.findHomography(obj, img, cv2.RANSAC, max(3.0, 0.3 * float(np.median(sides))))
+            if H is not None:
+                fits = mask.reshape(-1, 4).all(axis=1)
+                keep = [k for k, ok in zip(keep, fits) if ok]
+        # An id can only appear once; if an impostor survived, keep the first occurrence.
+        seen, unique = set(), []
+        for k in keep:
+            if int(ids[k]) not in seen:
+                seen.add(int(ids[k]))
+                unique.append(k)
+        return tuple(corners[k] for k in unique), np.array([ids[k] for k in unique], np.int32)
+
     def object_points(self, ids: np.ndarray) -> np.ndarray:
         return self._all_object_points[ids]
 
-    def square_outlines(self, det: Detection) -> list[np.ndarray]:
-        """Image outlines (4x2) of the black squares touching a detected corner.
+    def square_outlines(self, det: Detection, black: bool = True) -> list[np.ndarray]:
+        """Image outlines (4x2) of the black squares (or, with black=False, the white
+        squares holding the markers) touching a detected corner.
 
         Detected inner corners are used as-is; the board's outer corners, which have no
         detection of their own, are placed with a board-to-image homography.
@@ -109,6 +150,6 @@ class BoardDetector:
         outlines = []
         for y in range(sy):
             for x in range(sx):
-                if (x + y) % 2 == 0 and found[y:y + 2, x:x + 2].any():
+                if ((x + y) % 2 == 0) == black and found[y:y + 2, x:x + 2].any():
                     outlines.append(np.array([grid[y, x], grid[y, x + 1], grid[y + 1, x + 1], grid[y + 1, x]]))
         return outlines
