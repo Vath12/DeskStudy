@@ -1,5 +1,8 @@
 # Desk View
 
+!!!THIS APP IS VIBECODED!!!
+It's meant to work, not be well written.
+
 A calibrated, top-down view of your desk from a webcam, like macOS Desk View.
 
 ## Requirements
