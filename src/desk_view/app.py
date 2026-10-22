@@ -9,13 +9,14 @@ from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QDoubleValidator, QFont, QImage, QPainter
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QMainWindow, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
+    QWidget,
 )
 
 from .board import BoardDetector, BoardSpec
 from .calibrate import DeskStep, Intrinsics, LensStep, build_calibration, summary
 from .camera import CameraError, list_cameras, open_camera
-from .geometry import CONFIG_DIR, Calibration, build_maps, calibration_path, fit_viewport
+from .geometry import CONFIG_DIR, Calibration, build_maps, calibration_path, fit_viewport, wrap_degrees
 
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 OUTPUT_SIZE = (1280, 720)
@@ -88,7 +89,10 @@ class VideoView(QWidget):
 
     def mouseMoveEvent(self, e):
         if self._drag is not None:
-            self.app.drag_view(self._drag, e.position())
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.app.rotate_drag(self._drag, e.position())
+            else:
+                self.app.drag_view(self._drag, e.position())
             self._drag = e.position()
 
     def mouseReleaseEvent(self, e):
@@ -108,6 +112,10 @@ class VideoView(QWidget):
             self.app.zoom(1 / 1.1)
         elif k == Qt.Key.Key_Minus:
             self.app.zoom(1.1)
+        elif k == Qt.Key.Key_BracketLeft:
+            self.app.rotate_by(-1)
+        elif k == Qt.Key.Key_BracketRight:
+            self.app.rotate_by(1)
         else:
             super().keyPressEvent(e)
 
@@ -186,13 +194,28 @@ class MainWindow(QMainWindow):
         bar.addSpacing(8)
         self.fit_btn = QPushButton("Fit")
         self.fit_btn.clicked.connect(self.fit)
+        bar.addWidget(self.fit_btn)
+        bar.addSpacing(8)
+        bar.addWidget(QLabel("Rotation"))
+        self.rotation_spin = QDoubleSpinBox()
+        self.rotation_spin.setRange(-180.0, 180.0)
+        self.rotation_spin.setWrapping(True)
+        self.rotation_spin.setDecimals(1)
+        self.rotation_spin.setSingleStep(1.0)
+        self.rotation_spin.setSuffix("°")
+        self.rotation_spin.setFixedWidth(84)
+        self.rotation_spin.setToolTip("Turns the desk view clockwise to choose which way is up.\n"
+                                      "0° = level with the camera. Shift+drag or [ ] on the view also rotate.")
+        self.rotation_spin.setKeyboardTracking(False)  # apply on Enter / arrows, not every keystroke
+        self.rotation_spin.valueChanged.connect(self.set_rotation)
+        bar.addWidget(self.rotation_spin)
         self.rotate_btn = QPushButton("Rotate 180°")
-        self.rotate_btn.clicked.connect(self.rotate)
+        self.rotate_btn.clicked.connect(lambda: self.rotate_by(180))
         self.mirror_check = QCheckBox("Mirror")
         self.mirror_check.toggled.connect(self.toggle_mirror)
         self.vcam_check = QCheckBox("Virtual camera")
         self.vcam_check.toggled.connect(self.toggle_vcam)
-        for w in (self.fit_btn, self.rotate_btn, self.mirror_check, self.vcam_check):
+        for w in (self.rotate_btn, self.mirror_check, self.vcam_check):
             bar.addWidget(w)
         root.addLayout(bar)
 
@@ -256,7 +279,7 @@ class MainWindow(QMainWindow):
         has_view = self.calib is not None and not calibrating
         if not has_view:
             self.camera_radio.setChecked(True)
-        for w in (self.desk_radio, self.fit_btn, self.rotate_btn, self.mirror_check):
+        for w in (self.desk_radio, self.fit_btn, self.rotation_spin, self.rotate_btn, self.mirror_check):
             w.setEnabled(has_view)
         self.camera_radio.setEnabled(not calibrating)
         self.calibrate_btn.setEnabled(not calibrating and self.camera is not None)
@@ -265,6 +288,7 @@ class MainWindow(QMainWindow):
             self.mirror_check.blockSignals(True)
             self.mirror_check.setChecked(self.calib.viewport.mirror)
             self.mirror_check.blockSignals(False)
+            self._show_rotation()
         if not calibrating:
             if self.calib is None and self.camera is not None:
                 self.show_panel("Not calibrated", UNCALIBRATED_HELP, [("Start calibration", self.start_calibration)])
@@ -435,10 +459,32 @@ class MainWindow(QMainWindow):
                                               OUTPUT_SIZE[0] / OUTPUT_SIZE[1], OUTPUT_SIZE[0])
         self.view_changed()
 
-    def rotate(self) -> None:
+    def _show_rotation(self) -> None:
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(self.calib.viewport.rotation_deg)
+        self.rotation_spin.blockSignals(False)
+
+    def set_rotation(self, deg: float) -> None:
+        """Rotate the view clockwise by `deg` from the camera-aligned "up"."""
+        if self.calib is None or self.step is not None:
+            return
+        self.calib.viewport.rotation_deg = wrap_degrees(deg)
+        self._show_rotation()
+        self.view_changed()
+
+    def rotate_by(self, deg: float) -> None:
         if self.calib is not None and self.step is None:
-            self.calib.viewport.angle_deg += 180
-            self.view_changed()
+            self.set_rotation(self.calib.viewport.rotation_deg + deg)
+
+    def rotate_drag(self, start: QPointF, now: QPointF) -> None:
+        """Shift+drag: turn the view by the angle the cursor sweeps around its centre."""
+        if not self.desk_shown():
+            return
+        cx, cy = self.view.width() / 2, self.view.height() / 2
+        a0 = np.degrees(np.arctan2(start.y() - cy, start.x() - cx))
+        a1 = np.degrees(np.arctan2(now.y() - cy, now.x() - cx))
+        # Screen y points down, so a growing angle is a clockwise sweep.
+        self.rotate_by(wrap_degrees(a1 - a0))
 
     def toggle_mirror(self, checked: bool) -> None:
         if self.calib is not None and self.step is None:

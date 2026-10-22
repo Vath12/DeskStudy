@@ -64,9 +64,11 @@ Calibrations are stored per camera in `~/.config/desk_view/cameras/`.
 
 | Control | Action |
 | --- | --- |
-| drag / arrow keys | pan |
+| drag / arrow keys | pan (click the view first for keys) |
 | scroll / `+` `-` | zoom |
 | **Fit** | largest sharp area that is fully in view |
+| **Rotation** box | which way is "up": degrees clockwise from the camera-aligned default (0°) |
+| Shift+drag / `[` `]` | rotate freely / by 1° (updates the Rotation box) |
 | **Rotate 180°** | flip the view the right way up for the other person |
 | **Mirror** | mirror the view |
 | **Desk / Camera** | switch to the raw camera feed (the desk area is outlined) |

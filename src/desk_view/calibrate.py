@@ -301,8 +301,9 @@ def build_calibration(pose: DeskPose, detector: BoardDetector, size, out_size,
     if intrinsics is not None:
         calib.stats.update(intrinsics_rms_px=round(intrinsics.rms, 3), intrinsics_views=intrinsics.views)
     calib.viewport.angle_deg = calib.default_angle()
-    if old is not None:
+    if old is not None:  # keep the user's orientation choices across recalibration
         calib.viewport.mirror = old.viewport.mirror
+        calib.viewport.rotation_deg = old.viewport.rotation_deg
     center, width = fit_viewport(calib, spec.center_mm, spec.width_mm, out_size[0] / out_size[1], out_size[0])
     calib.viewport.center, calib.viewport.width_mm = center, width
     return calib

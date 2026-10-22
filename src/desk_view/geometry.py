@@ -11,6 +11,12 @@ import numpy as np
 CONFIG_DIR = Path.home() / ".config" / "desk_view"
 
 
+def wrap_degrees(deg: float) -> float:
+    """Normalise an angle to (-180, 180]."""
+    deg = (deg + 180.0) % 360.0 - 180.0
+    return 180.0 if deg == -180.0 else deg
+
+
 def calibration_path(camera_id: str) -> Path:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in camera_id)
     return CONFIG_DIR / "cameras" / f"{safe}.json"
@@ -21,18 +27,21 @@ class Viewport:
     """A rectangle on the desk, in board millimetres, that becomes the output image.
 
     `angle_deg` is the direction (in the board plane) that appears at the top of the
-    output. By default it points from the board towards the camera, so the view is
-    upright for the person sitting at the desk.
+    output before any user rotation; calibration aligns it with the camera, so the view is
+    level with the screen. `rotation_deg` is the user's rotation on top of that, clockwise
+    as seen in the output (also when mirrored).
     """
 
     center: tuple[float, float]
     width_mm: float
     angle_deg: float
     mirror: bool = False
+    rotation_deg: float = 0.0
 
     def axes(self) -> tuple[np.ndarray, np.ndarray]:
         """Unit vectors on the desk for output +x (right) and +y (down)."""
-        a = math.radians(self.angle_deg)
+        # Increasing the desk angle turns the image counter-clockwise (clockwise if mirrored).
+        a = math.radians(self.angle_deg - self.rotation_deg * (-1 if self.mirror else 1))
         down = -np.array([math.cos(a), math.sin(a)])
         right = np.array([down[1], -down[0]])
         return (-right if self.mirror else right), down
@@ -137,7 +146,8 @@ class Calibration:
             stats["desk_rms_mm"] = round(stats["desk_rms_mm"] * s, 3)
         return Calibration(**{
             **self.__dict__, "tvec": self.tvec * s, "square_mm": square_mm, "stats": stats,
-            "viewport": Viewport(tuple(np.asarray(vp.center) * s), vp.width_mm * s, vp.angle_deg, vp.mirror),
+            "viewport": Viewport(tuple(np.asarray(vp.center) * s), vp.width_mm * s, vp.angle_deg,
+                                 vp.mirror, vp.rotation_deg),
         })
 
     def default_angle(self) -> float:
@@ -177,7 +187,8 @@ class Calibration:
             rvec=np.array(d["rvec"], np.float64).reshape(3, 1),
             tvec=np.array(d["tvec"], np.float64).reshape(3, 1),
             square_mm=d["square_mm"],
-            viewport=Viewport(tuple(vp["center"]), vp["width_mm"], vp["angle_deg"], vp["mirror"]),
+            viewport=Viewport(tuple(vp["center"]), vp["width_mm"], vp["angle_deg"], vp["mirror"],
+                              vp.get("rotation_deg", 0.0)),
             intrinsics_method=d.get("intrinsics_method", "single-view"),
             stats=d.get("stats", {}),
         )
