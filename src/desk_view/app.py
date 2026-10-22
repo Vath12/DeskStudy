@@ -35,8 +35,8 @@ LENS_HELP = ("Hold the chart flat (tape it to cardboard) and move it around the 
 DESK_HELP = ("Lay the chart flat on the desk, in the middle of the area you want to show, and keep "
              "your hands clear. Any rotation works. It locks in by itself once the chart is still; "
              "Lock in forces it.")
-UNCALIBRATED_HELP = ("Print a chart from the calibration_chart folder at 100% scale, measure one black "
-                     "square, enter its size above, then calibrate.")
+UNCALIBRATED_HELP = ("Run ./generate_calibration_charts.sh and print a chart from the calibration_chart "
+                     "folder at 100% scale, measure one black square, enter its size above, then calibrate.")
 
 
 def _load_settings() -> dict:
