@@ -1,0 +1,30 @@
+[project]
+name = "desk-view"
+version = "0.1.0"
+description = "A calibrated, top-down desk camera view (like macOS Desk View) for any webcam"
+readme = "README.md"
+authors = [
+    { email = "69534310+Vath12@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.5.4",
+    "opencv-python>=4.10",
+    "pillow>=13.0.0",
+    "pyobjc-framework-avfoundation>=12.2.2 ; sys_platform == 'darwin'",
+    "pyobjc-framework-libdispatch>=12.2.2 ; sys_platform == 'darwin'",
+    "pyobjc-framework-quartz>=12.2.2 ; sys_platform == 'darwin'",
+    "pyqt6>=6.11.0",
+]
+
+[project.scripts]
+desk-view = "desk_view:main"
+
+[project.optional-dependencies]
+virtualcam = [
+    "pyvirtualcam>=0.15.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
