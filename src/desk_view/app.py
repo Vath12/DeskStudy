@@ -1,7 +1,9 @@
 """The Desk View window: live view, camera picker and in-app calibration (Qt)."""
 
 import json
+import math
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -9,18 +11,22 @@ from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QDoubleValidator, QFont, QImage, QPainter
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QDoubleSpinBox, QMainWindow, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QSplitter,
-    QVBoxLayout, QWidget,
+    QDoubleSpinBox, QMainWindow, QMenu, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
+    QWidget,
 )
 
 from .board import BoardDetector, BoardSpec
 from .calibrate import DeskStep, Intrinsics, LensStep, build_calibration, summary
 from .camera import CameraError, list_cameras, open_camera
 from .geometry import CONFIG_DIR, Calibration, build_maps, calibration_path, fit_viewport, wrap_degrees
-from .web import WebPane  # imports QtWebEngine, which must happen before QApplication exists
+from .scans import save_scan
+from .sidebar import ScanSidebar
+from .web import AI_SITES, MORE_AI_SITES, default_browser, open_on_left
 
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
-OUTPUT_SIZE = (1280, 720)
+VCAM_SIZE = (1280, 720)  # the virtual camera needs a fixed, standard size
+MAX_VIEW_PIXELS = 2_400_000  # about what the camera can resolve; more just costs time
+SCAN_PIXELS = 6_000_000  # scans are rendered sharper than the live view
 OUTLINE_COLOR = (0, 200, 255)
 
 LENS_HELP = ("Hold the chart flat (tape it to cardboard) and move it around the frame: near and far, "
@@ -60,6 +66,7 @@ class VideoView(QWidget):
         self.app = app
         self.image: QImage | None = None
         self.scale = 1.0  # displayed (logical) pixels per frame pixel
+        self.flash = 0.0  # white flash after a scan, fades out
         self._drag: QPointF | None = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -84,6 +91,13 @@ class VideoView(QWidget):
             w = self.image.width() / self.image.devicePixelRatio()
             h = self.image.height() / self.image.devicePixelRatio()
             p.drawImage(QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h), self.image)
+        if self.flash > 0:
+            p.fillRect(self.rect(), QColor(255, 255, 255, int(200 * self.flash)))
+            self.flash = max(0.0, self.flash - 0.15)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.app.view_resized(e.oldSize().width(), e.size().width())
 
     def mousePressEvent(self, e):
         self._drag = e.position()
@@ -117,6 +131,8 @@ class VideoView(QWidget):
             self.app.rotate_by(-1)
         elif k == Qt.Key.Key_BracketRight:
             self.app.rotate_by(1)
+        elif k == Qt.Key.Key_Space:
+            self.app.scan()
         else:
             super().keyPressEvent(e)
 
@@ -129,13 +145,16 @@ class MainWindow(QMainWindow):
         self.camera = None
         self.calib: Calibration | None = None
         self.maps = None
+        self.maps_size = None
+        self.vcam_maps = None
         self.maps_dirty = False
+        self.last_frame = None
         self.step: LensStep | DeskStep | None = None
         self.vcam = None
         self.panel_buttons: dict[str, QPushButton] = {}
 
         self.setWindowTitle("Desk View")
-        self.resize(1700, 900)
+        self.resize(1200, 860)
         self._build_ui()
 
         self._save_timer = QTimer(self, singleShot=True, interval=800)
@@ -157,20 +176,11 @@ class MainWindow(QMainWindow):
     # --- layout ---------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Web page on the left, desk view on the right; drag the divider to resize either.
-        self.web = WebPane(self.settings.get("web_url"), on_url_changed=self._remember_url)
-        desk = QWidget()
-        root = QVBoxLayout(desk)
-        root.setContentsMargins(6, 10, 12, 6)
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 6)
         root.setSpacing(8)
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.addWidget(self.web)
-        self.splitter.addWidget(desk)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
-        sizes = self.settings.get("splitter")
-        self.splitter.setSizes(sizes if isinstance(sizes, list) and len(sizes) == 2 else [760, 940])
-        self.setCentralWidget(self.splitter)
+        self.setCentralWidget(central)
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Camera"))
@@ -192,6 +202,7 @@ class MainWindow(QMainWindow):
         self.calibrate_btn.clicked.connect(self.start_calibration)
         bar.addWidget(self.calibrate_btn)
         bar.addStretch(1)
+
         root.addLayout(bar)
 
         bar = QHBoxLayout()  # second row: view controls
@@ -232,6 +243,44 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         root.addLayout(bar)
 
+        # Third row: scanning, plus opening the real browser or an AI site to drop scans
+        # into, on the left half of the screen (Desk View moves to the right half).
+        bar = QHBoxLayout()
+        browser = default_browser()
+        browser_name = browser[1] if browser else "your browser"
+        self.web_buttons: list[QPushButton] = []
+
+        self.scans_btn = QPushButton("Scans")
+        self.scans_btn.setCheckable(True)
+        self.scans_btn.setToolTip("Show or hide the saved scans. Drag a scan into your browser to upload it.")
+        self.scans_btn.toggled.connect(self.toggle_sidebar)
+        bar.addWidget(self.scans_btn)
+        self.scan_btn = QPushButton("Scan")
+        self.scan_btn.setToolTip("Save a picture of the visible desk area (Space on the view).")
+        self.scan_btn.clicked.connect(self.scan)
+        bar.addWidget(self.scan_btn)
+        bar.addSpacing(12)
+
+        def web_button(label: str, url: str | None, tip: str) -> QPushButton:
+            b = QPushButton(label)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda: self.open_web_page(url, label))
+            bar.addWidget(b)
+            self.web_buttons.append(b)
+            return b
+
+        web_button("Browser", None, f"Open a new {browser_name} window on the left half of the screen.")
+        for label, url in AI_SITES:
+            web_button(label, url, f"Open {label} on the left; drag scans from the sidebar into it.")
+        more = web_button("More ▾", None, "Other AI sites that accept images.")
+        more.clicked.disconnect()
+        menu = QMenu(more)
+        for label, url in MORE_AI_SITES:
+            menu.addAction(label, lambda checked=False, u=url, n=label: self.open_web_page(u, n))
+        more.setMenu(menu)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
         # Calibration / onboarding panel, shown only when needed.
         self.panel = QFrame()
         panel = QVBoxLayout(self.panel)
@@ -259,8 +308,17 @@ class MainWindow(QMainWindow):
         root.addWidget(self.panel)
         self.panel.hide()
 
+        # Scans sidebar on the left of the view; the view fills everything else.
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        self.sidebar = ScanSidebar()
+        body.addWidget(self.sidebar)
         self.view = VideoView(self)
-        root.addWidget(self.view, 1)
+        body.addWidget(self.view, 1)
+        root.addLayout(body, 1)
+        show = bool(self.settings.get("sidebar", True))
+        self.sidebar.setVisible(show)
+        self.scans_btn.setChecked(show)
 
     def set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
@@ -292,7 +350,8 @@ class MainWindow(QMainWindow):
         has_view = self.calib is not None and not calibrating
         if not has_view:
             self.camera_radio.setChecked(True)
-        for w in (self.desk_radio, self.fit_btn, self.rotation_spin, self.rotate_btn, self.mirror_check):
+        for w in (self.desk_radio, self.fit_btn, self.rotation_spin, self.rotate_btn, self.mirror_check,
+                  self.scan_btn):
             w.setEnabled(has_view)
         self.camera_radio.setEnabled(not calibrating)
         self.calibrate_btn.setEnabled(not calibrating and self.camera is not None)
@@ -422,7 +481,7 @@ class MainWindow(QMainWindow):
 
     def finish_desk(self) -> None:
         pose = self.step.result
-        self.calib = build_calibration(pose, self.detector, self.camera.size, OUTPUT_SIZE,
+        self.calib = build_calibration(pose, self.detector, self.camera.size, self.desk_size(),
                                        self.intrinsics, old=self.calib)
         self.calib.save(calibration_path(self.camera.unique_id))
         self.end_calibration()
@@ -468,8 +527,8 @@ class MainWindow(QMainWindow):
             return
         spec = BoardSpec().with_square_mm(self.calib.square_mm)
         vp = self.calib.viewport
-        vp.center, vp.width_mm = fit_viewport(self.calib, spec.center_mm, spec.width_mm,
-                                              OUTPUT_SIZE[0] / OUTPUT_SIZE[1], OUTPUT_SIZE[0])
+        out_w, out_h = self.desk_size()
+        vp.center, vp.width_mm = fit_viewport(self.calib, spec.center_mm, spec.width_mm, out_w / out_h, out_w)
         self.view_changed()
 
     def _show_rotation(self) -> None:
@@ -506,7 +565,7 @@ class MainWindow(QMainWindow):
 
     def _view_to_desk(self, pos: QPointF) -> np.ndarray:
         """Desk point (mm) under a position in the video widget."""
-        mm_per_px = self.calib.viewport.width_mm / OUTPUT_SIZE[0] / self.view.scale
+        mm_per_px = self.calib.viewport.width_mm / self.desk_size()[0] / self.view.scale
         u = (pos.x() - self.view.width() / 2) * mm_per_px
         v = (pos.y() - self.view.height() / 2) * mm_per_px
         vp = self.calib.viewport
@@ -548,7 +607,7 @@ class MainWindow(QMainWindow):
         try:
             import pyvirtualcam
 
-            self.vcam = pyvirtualcam.Camera(*OUTPUT_SIZE, fps=30, fmt=pyvirtualcam.PixelFormat.BGR)
+            self.vcam = pyvirtualcam.Camera(*VCAM_SIZE, fps=30, fmt=pyvirtualcam.PixelFormat.BGR)
             self.set_status(f"Virtual camera on: {self.vcam.device}")
         except ImportError:
             self._uncheck_vcam("Virtual camera needs the extra package:  uv sync --extra virtualcam")
@@ -564,8 +623,75 @@ class MainWindow(QMainWindow):
 
     # --- persistence ----------------------------------------------------------------
 
-    def _remember_url(self, url: str) -> None:
-        self.settings["web_url"] = url
+    # --- view size, scans and sidebar --------------------------------------------------
+
+    def desk_size(self) -> tuple[int, int]:
+        """Desk view render size: the view's own shape (so it fills it, no letterboxing),
+        at Retina resolution but capped at what the camera can actually resolve."""
+        w, h = max(self.view.width(), 16), max(self.view.height(), 16)
+        s = min(self.view.devicePixelRatioF(), math.sqrt(MAX_VIEW_PIXELS / (w * h)))
+        return max(16, round(w * s)), max(16, round(h * s))
+
+    def view_resized(self, old_width: int, new_width: int) -> None:
+        """Keep the desk's scale when the window changes size: a bigger window shows more."""
+        if self.calib is not None and old_width > 0 and new_width > 0:
+            self.calib.viewport.width_mm *= new_width / old_width
+            self.view_changed()
+
+    def scan(self) -> None:
+        """Save a sharp picture of exactly the visible desk area to the scans folder."""
+        if self.calib is None or self.step is not None or self.last_frame is None:
+            self.set_status("Calibrate first: scans are taken from the desk view.")
+            return
+        w, h = self.desk_size()
+        k = math.sqrt(SCAN_PIXELS / (w * h))
+        size = (round(w * k), round(h * k))
+        image = cv2.remap(self.last_frame, *build_maps(self.calib, size), cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_CONSTANT)
+        try:
+            path = save_scan(image)
+        except OSError as e:
+            self.set_status(str(e))
+            return
+        self.view.flash = 1.0
+        self.sidebar.refresh(select=path)
+        if not self.scans_btn.isChecked():
+            self.scans_btn.setChecked(True)
+        self.set_status(f"Saved scan {path.name} ({size[0]}x{size[1]}).")
+
+    def toggle_sidebar(self, show: bool) -> None:
+        self.sidebar.setVisible(show)
+        self.settings["sidebar"] = show
+        self._save_settings()
+
+    # --- web page -------------------------------------------------------------------
+
+    def open_web_page(self, url: str | None, label: str = "Browser") -> None:
+        """Open `url` (None: just a browser window) on the left half of the screen."""
+        # Desk View takes the right half of this screen; the browser gets the left half.
+        area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        half = area.width() // 2
+        self.showNormal()
+        title_h = self.frameGeometry().height() - self.geometry().height()
+        self.setGeometry(area.x() + half, area.y() + title_h, area.width() - half, area.height() - title_h)
+        bounds = (area.x(), area.y(), area.x() + half, area.y() + area.height())
+
+        # AppleScript can wait on a macOS permission prompt, so run it off the UI thread.
+        for b in self.web_buttons:
+            b.setEnabled(False)
+        self.set_status(f"Opening {label}…")
+        result: list[str] = []
+        threading.Thread(target=lambda: result.append(open_on_left(url, bounds)), daemon=True).start()
+
+        def poll():
+            if not result:
+                QTimer.singleShot(100, poll)
+                return
+            for b in self.web_buttons:
+                b.setEnabled(True)
+            self.set_status(result[0])
+
+        poll()
 
     def _save_settings(self) -> None:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -593,22 +719,25 @@ class MainWindow(QMainWindow):
             self.update_panel()
             return
 
-        desk = None
-        if self.calib is not None and (self.desk_radio.isChecked() or self.vcam):
-            if self.maps_dirty or self.maps is None:
-                self.maps = build_maps(self.calib, OUTPUT_SIZE)
-                self.maps_dirty = False
-            desk = cv2.remap(frame, *self.maps, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            if self.vcam:
-                self.vcam.send(desk)
+        self.last_frame = frame
+        size = self.desk_size()
+        if self.calib is not None and (self.maps_dirty or self.maps_size != size):
+            self.maps = build_maps(self.calib, size) if self.desk_radio.isChecked() else None
+            self.maps_size = size if self.maps is not None else None
+            self.vcam_maps = None
+            self.maps_dirty = False
+        if self.vcam and self.calib is not None:
+            if self.vcam_maps is None:
+                self.vcam_maps = build_maps(self.calib, VCAM_SIZE)  # same view, framed 16:9
+            self.vcam.send(cv2.remap(frame, *self.vcam_maps, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT))
 
-        if self.desk_radio.isChecked() and desk is not None:
-            self.view.set_frame(desk)
+        if self.desk_radio.isChecked() and self.maps is not None:
+            self.view.set_frame(cv2.remap(frame, *self.maps, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT))
         else:
             vis = frame
             if self.calib is not None:
                 vis = frame.copy()
-                pix, in_front = self.calib.project_desk(self.calib.viewport.outline(*OUTPUT_SIZE))
+                pix, in_front = self.calib.project_desk(self.calib.viewport.outline(*size))
                 pts = pix[in_front].astype(np.int32)
                 if len(pts):
                     cv2.polylines(vis, [pts], True, OUTLINE_COLOR, max(2, vis.shape[1] // 500), cv2.LINE_AA)
@@ -616,9 +745,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._tick.stop()
-        self.settings["splitter"] = self.splitter.sizes()
-        self._save_settings()
-        self.web.shutdown()
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._save_calibration()

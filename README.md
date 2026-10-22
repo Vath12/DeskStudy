@@ -72,23 +72,38 @@ Calibrations are stored per camera in `~/.config/desk_view/cameras/`.
 | **Rotate 180°** | flip the view the right way up for the other person |
 | **Mirror** | mirror the view |
 | **Desk / Camera** | switch to the raw camera feed (the desk area is outlined) |
+| **Scan** / `Space` | save the visible area to `scans/` |
+| **Scans** | show/hide the scans sidebar |
 
-View changes are saved automatically.
+The desk view fills the whole view area. Resizing the window shows more or less of the
+desk at the same scale. View changes are saved automatically.
 
-### Web page
+### Scans
 
-The left side of the window is a full browser (Chromium, via Qt WebEngine), so you can
-keep ChatGPT or docs open next to the desk view. Type in the address bar:
+**Scan** (or `Space` on the view) saves a sharp picture of exactly the visible desk area to
+`scans/` in the project folder (gitignored), named by number and time, e.g.
+`0003_2026-10-22_15-40-12.png`. **Scans** shows a sidebar of thumbnails on the left:
 
-- a name such as `chatgpt`, `claude` or `gemini` opens that site. Any other single word
-  opens `word.com`;
-- a domain or full URL opens it, and anything with spaces is a Google search.
+- drag a scan (or several) into your browser, for example onto ChatGPT's message box, to
+  upload it. Dropping into Finder, Mail and so on works too;
+- double-click to open it in Preview, or right-click for *Show in Finder* or *Move to Trash*.
 
-Logins persist between runs (stored in `~/.config/desk_view/web/`), sign-in popups open in
-their own window, and downloads go to `~/Downloads`. Sites must ask before using the camera,
-microphone, location or notifications. Drag the divider to resize or hide the page. The last
-page and divider position are remembered. The code is in
-[`src/desk_view/web/`](src/desk_view/web/).
+### Browser and AI sites
+
+The bottom row of buttons opens your default browser on the left half of the screen and
+moves Desk View to the right half, so you can drag scans from the sidebar straight into it:
+
+- **Browser**: a new, empty browser window;
+- **ChatGPT**, **Claude**, **Gemini**, **DeepSeek**: open that AI chat;
+- **More ▾**: Microsoft Copilot, Perplexity, Grok, Mistral Le Chat and Qwen.
+
+A real browser is used so that sign-in (including "Continue with Google") works normally.
+Google blocks sign-in from browsers embedded in apps. Chrome, Edge, Brave, Vivaldi,
+Chromium and Safari are positioned through their own AppleScript, and macOS asks once for
+permission to control the browser (System Settings → Privacy & Security → Automation).
+Other browsers such as Firefox are positioned through System Events, which needs
+Accessibility access. The site list is in
+[`src/desk_view/web/launcher.py`](src/desk_view/web/launcher.py).
 
 ### Use in video calls
 

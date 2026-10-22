@@ -194,33 +194,27 @@ class Calibration:
         )
 
 
-def _upsample(grid: np.ndarray, step: int, out_w: int, out_h: int) -> np.ndarray:
-    """Bilinearly interpolate a grid sampled every `step` pixels up to full size."""
-    fx, fy = np.arange(out_w) / step, np.arange(out_h) / step
-    x0 = np.minimum(fx.astype(int), grid.shape[1] - 2)
-    y0 = np.minimum(fy.astype(int), grid.shape[0] - 2)
-    tx, ty = (fx - x0)[None, :, None], (fy - y0)[:, None, None]
-    rows = grid[:, x0] * (1 - tx) + grid[:, x0 + 1] * tx
-    return rows[y0] * (1 - ty) + rows[y0 + 1] * ty
-
-
 def build_maps(calib: Calibration, out_size: tuple[int, int], step: int = 8) -> tuple[np.ndarray, np.ndarray]:
     """Remap tables that undistort and rectify the desk in one step.
 
-    The mapping is smooth, so it is projected on a coarse grid and interpolated, which
-    keeps panning/zooming responsive at well under 0.1 px error.
+    The mapping is smooth, so it is projected on a coarse grid and bilinearly interpolated
+    (with cv2.remap, which is fast even for large views) at well under 0.1 px error.
     """
     out_w, out_h = out_size
     xs = np.arange(0, out_w - 1 + step, step)
     ys = np.arange(0, out_h - 1 + step, step)
     pixels, in_front = calib.project_desk(calib.viewport.desk_points(out_w, out_h, xs, ys))
-    pixels[~in_front] = np.nan
-    full = _upsample(pixels, step, out_w, out_h).astype(np.float32)
-    # Points near the horizon project absurdly far away; outside the frame they are just
-    # black, and leaving them would overflow the 16-bit fixed-point maps.
     w, h = calib.image_size
-    outside = (np.isnan(full).any(axis=-1) | (full[..., 0] < -2) | (full[..., 0] > w + 1)
-               | (full[..., 1] < -2) | (full[..., 1] > h + 1))
+    # Points near the horizon project absurdly far away and points behind the camera are
+    # meaningless; mark both far outside the frame so anything interpolated from them is too
+    # (and so nothing overflows the 16-bit fixed-point maps).
+    bad = ~in_front | ~np.isfinite(pixels).all(axis=-1) | (np.abs(pixels) > 4 * max(w, h)).any(axis=-1)
+    grid = pixels.astype(np.float32)
+    grid[bad] = -10 * max(w, h)
+    gx = np.repeat((np.arange(out_w, dtype=np.float32) / step)[None, :], out_h, axis=0)
+    gy = np.repeat((np.arange(out_h, dtype=np.float32) / step)[:, None], out_w, axis=1)
+    full = cv2.remap(grid, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    outside = ((full[..., 0] < -2) | (full[..., 0] > w + 1) | (full[..., 1] < -2) | (full[..., 1] > h + 1))
     full[outside] = -1
     return cv2.convertMaps(full[..., 0], full[..., 1], cv2.CV_16SC2)
 

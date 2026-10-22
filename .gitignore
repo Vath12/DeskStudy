@@ -11,3 +11,7 @@ wheels/
 
 # macOS
 .DS_Store
+
+# Desk scans
+/scans/
+calibration_chart/
