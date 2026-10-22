@@ -15,6 +15,8 @@ from .geometry import Calibration, Viewport, fit_viewport
 
 SQUARE_COLOR = (40, 40, 230)  # BGR red
 MARKER_COLOR = (230, 120, 30)  # BGR blue
+# Below this chart tilt (degrees from facing the camera) one view can't measure focal length.
+FOCAL_MIN_TILT_DEG = 5.0
 COVERAGE_COLOR = np.array([0, 160, 0])
 
 
@@ -303,7 +305,7 @@ def solve_desk_pose(corners, ids, detector: BoardDetector, size,
         ok, rvec0, _ = cv2.solvePnP(obj, corners, K0, dist, flags=cv2.SOLVEPNP_IPPE)
         tilt = np.degrees(np.arccos(min(1.0, abs(cv2.Rodrigues(rvec0)[0][2, 2])))) if ok else 0.0
         K, method = K0, "assumed"
-        if tilt >= 25:
+        if tilt >= FOCAL_MIN_TILT_DEG:
             flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT
                      | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_ZERO_TANGENT_DIST
                      | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
