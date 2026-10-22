@@ -21,7 +21,7 @@ from .camera import CameraError, list_cameras, open_camera
 from .geometry import CONFIG_DIR, Calibration, build_maps, calibration_path, fit_viewport, wrap_degrees
 from .scans import save_scan
 from .sidebar import ScanSidebar
-from .web import AI_SITES, MORE_AI_SITES, default_browser, open_on_left
+from .web import AI_SITES, MORE_AI_SITES, BrowserLauncher, default_browser
 
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 VCAM_SIZE = (1280, 720)  # the virtual camera needs a fixed, standard size
@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self.last_frame = None
         self.step: LensStep | DeskStep | None = None
         self.vcam = None
+        self.launcher = BrowserLauncher()
         self.panel_buttons: dict[str, QPushButton] = {}
 
         self.setWindowTitle("Desk View")
@@ -667,29 +668,32 @@ class MainWindow(QMainWindow):
     # --- web page -------------------------------------------------------------------
 
     def open_web_page(self, url: str | None, label: str = "Browser") -> None:
-        """Open `url` (None: just a browser window) on the left half of the screen."""
-        # Desk View takes the right half of this screen; the browser gets the left half.
+        """Open `url` (None: a blank page): the first time in a new browser window on the left
+        half of the screen, after that as a new tab in that window."""
         area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         half = area.width() // 2
-        self.showNormal()
-        title_h = self.frameGeometry().height() - self.geometry().height()
-        self.setGeometry(area.x() + half, area.y() + title_h, area.width() - half, area.height() - title_h)
         bounds = (area.x(), area.y(), area.x() + half, area.y() + area.height())
 
         # AppleScript can wait on a macOS permission prompt, so run it off the UI thread.
         for b in self.web_buttons:
             b.setEnabled(False)
         self.set_status(f"Opening {label}…")
-        result: list[str] = []
-        threading.Thread(target=lambda: result.append(open_on_left(url, bounds)), daemon=True).start()
+        result: list[tuple[str, bool]] = []
+        threading.Thread(target=lambda: result.append(self.launcher.open(url, bounds)), daemon=True).start()
 
         def poll():
             if not result:
                 QTimer.singleShot(100, poll)
                 return
+            message, new_window = result[0]
             for b in self.web_buttons:
                 b.setEnabled(True)
-            self.set_status(result[0])
+            if new_window:  # the browser took the left half; Desk View takes the right
+                self.showNormal()
+                title_h = self.frameGeometry().height() - self.geometry().height()
+                self.setGeometry(area.x() + half, area.y() + title_h, area.width() - half,
+                                 area.height() - title_h)
+            self.set_status(message)
 
         poll()
 

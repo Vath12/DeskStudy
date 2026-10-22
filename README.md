@@ -91,7 +91,9 @@ desk at the same scale. View changes are saved automatically.
 ### Browser and AI sites
 
 The bottom row of buttons opens your default browser on the left half of the screen and
-moves Desk View to the right half, so you can drag scans from the sidebar straight into it:
+moves Desk View to the right half, so you can drag scans from the sidebar straight into it.
+The first click opens a new window; later clicks open new tabs in that window (or a new
+window again if you closed it):
 
 - **Browser**: a new, empty browser window;
 - **ChatGPT**, **Claude**, **Gemini**, **DeepSeek**: open that AI chat;

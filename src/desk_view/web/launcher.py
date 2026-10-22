@@ -29,18 +29,19 @@ CHROMIUM_IDS = {"com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrom
                 "com.vivaldi.Vivaldi"}
 SAFARI_IDS = {"com.apple.Safari", "com.apple.SafariTechnologyPreview"}
 
-# All scripts take: url ("" for the browser's own new-window page), left, top, right,
-# bottom (screen points, top-left origin).
-_CHROMIUM_SCRIPT = """on run argv
+# New-window scripts take: url ("" for the browser's own new-window page), left, top,
+# right, bottom (screen points, top-left origin), and print the new window's id.
+_CHROMIUM_WINDOW = """on run argv
   set {theURL, l, t, r, b} to argv
   tell application id "%s"
     activate
     set w to make new window
     if theURL is not "" then set URL of active tab of w to theURL
     set bounds of w to {l as integer, t as integer, r as integer, b as integer}
+    return id of w
   end tell
 end run"""
-_SAFARI_SCRIPT = """on run argv
+_SAFARI_WINDOW = """on run argv
   set {theURL, l, t, r, b} to argv
   tell application id "%s"
     activate
@@ -49,12 +50,14 @@ _SAFARI_SCRIPT = """on run argv
     else
       make new document with properties {URL:theURL}
     end if
-    set bounds of front window to {l as integer, t as integer, r as integer, b as integer}
+    set w to front window
+    set bounds of w to {l as integer, t as integer, r as integer, b as integer}
+    return id of w
   end tell
 end run"""
 # Any other browser: open normally, then move its window via System Events
-# (needs Accessibility permission for the app running Desk View).
-_GENERIC_SCRIPT = """on run argv
+# (needs Accessibility permission for the app running Desk View). No window id.
+_GENERIC_WINDOW = """on run argv
   set {theURL, l, t, r, b} to argv
   if theURL is "" then
     do shell script "open -b %s"
@@ -68,6 +71,39 @@ _GENERIC_SCRIPT = """on run argv
       set position of front window to {l as integer, t as integer}
       set size of front window to {(r - l) as integer, (b - t) as integer}
     end tell
+  end tell
+  return ""
+end run"""
+
+# New-tab scripts take: url, window id. They fail if that window has been closed.
+_CHROMIUM_TAB = """on run argv
+  set {theURL, winId} to argv
+  tell application id "%s"
+    set w to window id (winId as integer)
+    if theURL is "" then
+      make new tab at end of tabs of w
+    else
+      make new tab at end of tabs of w with properties {URL:theURL}
+    end if
+    set active tab index of w to (count of tabs of w)
+    set index of w to 1
+    activate
+  end tell
+end run"""
+_SAFARI_TAB = """on run argv
+  set {theURL, winId} to argv
+  tell application id "%s"
+    set w to window id (winId as integer)
+    tell w
+      if theURL is "" then
+        set newTab to make new tab at end of tabs
+      else
+        set newTab to make new tab at end of tabs with properties {URL:theURL}
+      end if
+      set current tab to newTab
+    end tell
+    set index of w to 1
+    activate
   end tell
 end run"""
 
@@ -87,38 +123,68 @@ def default_browser() -> tuple[str, str] | None:
     return str(bundle.bundleIdentifier()), str(name or app_url.path())
 
 
-def open_on_left(url: str | None, bounds: tuple[int, int, int, int]) -> str:
-    """Open `url` (or just a new browser window, if None) in the default browser, in a
-    window covering `bounds` (left, top, right, bottom). Blocks until done, so call it off
-    the UI thread. Returns a status message."""
-    url = url or ""
-    what = url or "a new window"
-    browser = default_browser()
-    if browser is None:
-        webbrowser.open(url or "about:blank")
-        return "Opened in your browser (window placement is only supported on macOS)."
-    bundle_id, name = browser
-    if bundle_id in CHROMIUM_IDS:
-        script = _CHROMIUM_SCRIPT % bundle_id
-    elif bundle_id in SAFARI_IDS:
-        script = _SAFARI_SCRIPT % bundle_id
-    else:
-        script = _GENERIC_SCRIPT % (bundle_id, bundle_id, bundle_id)
-    args = [url, *(str(int(v)) for v in bounds)]
-    try:
-        result = subprocess.run(["osascript", "-e", script, *args], capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return f"{name} didn't respond. Check for a permission prompt."
-    if result.returncode == 0:
-        return f"Opened {what} in {name} on the left."
-    err = result.stderr.strip()
-    if "-1743" in err or "Not authorized" in err:
-        return (f"macOS blocked controlling {name}. Allow it in System Settings → Privacy & Security → "
-                "Automation, then try again.")
-    fallback = ["open", "-b", bundle_id, *([url] if url else [])]
-    if "-1719" in err or "assistive" in err.lower():
-        subprocess.run(fallback)
-        return (f"Opened in {name}, but placing its window needs Accessibility access "
-                "(System Settings → Privacy & Security → Accessibility).")
-    subprocess.run(fallback)
-    return f"Opened in {name}, but couldn't place the window: {err or 'unknown error'}"
+class BrowserLauncher:
+    """Opens pages in the default browser: the first time in a new window on the left half
+    of the screen, after that as new tabs in that same window (a new window again if the
+    user has closed it)."""
+
+    def __init__(self):
+        self._window: tuple[str, str] | None = None  # (browser bundle id, window id)
+        self._generic_opened = False
+
+    def open(self, url: str | None, bounds: tuple[int, int, int, int]) -> tuple[str, bool]:
+        """Open `url` (None: the browser's blank page). Blocks, so call it off the UI thread.
+        Returns (status message, whether a new window was placed at `bounds`)."""
+        url = url or ""
+        browser = default_browser()
+        if browser is None:
+            webbrowser.open(url or "about:blank")
+            return "Opened in your browser (window placement is only supported on macOS).", False
+        bundle_id, name = browser
+
+        if bundle_id in CHROMIUM_IDS | SAFARI_IDS:
+            if self._window and self._window[0] == bundle_id:
+                tab = (_CHROMIUM_TAB if bundle_id in CHROMIUM_IDS else _SAFARI_TAB) % bundle_id
+                ok, _ = self._run(tab, [url, self._window[1]])
+                if ok is True:
+                    return (f"Opened {url} in a new tab." if url else "Opened a new tab."), False
+                # The window was closed (or the browser quit): start over with a new one.
+                self._window = None
+            script = (_CHROMIUM_WINDOW if bundle_id in CHROMIUM_IDS else _SAFARI_WINDOW) % bundle_id
+        else:
+            if self._generic_opened:
+                # Most browsers open links as a tab in their front window by themselves.
+                subprocess.run(["open", "-b", bundle_id, *([url] if url else [])])
+                return f"Opened {url or name} in {name}.", False
+            script = _GENERIC_WINDOW % (bundle_id, bundle_id, bundle_id)
+
+        ok, out = self._run(script, [url, *(str(int(v)) for v in bounds)])
+        if ok is True:
+            if out:
+                self._window = (bundle_id, out)
+            else:
+                self._generic_opened = True
+            return f"Opened {url or 'a new window'} in {name} on the left.", True
+        return self._explain_failure(out, bundle_id, name, url), False
+
+    @staticmethod
+    def _run(script: str, args: list[str]) -> tuple[bool | None, str]:
+        """(True, stdout) on success, (False, stderr) on failure, (None, "") on timeout."""
+        try:
+            r = subprocess.run(["osascript", "-e", script, *args], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return None, ""
+        return (True, r.stdout.strip()) if r.returncode == 0 else (False, r.stderr.strip())
+
+    @staticmethod
+    def _explain_failure(err: str, bundle_id: str, name: str, url: str) -> str:
+        if not err:
+            return f"{name} didn't respond. Check for a permission prompt."
+        if "-1743" in err or "Not authorized" in err:
+            return (f"macOS blocked controlling {name}. Allow it in System Settings → Privacy & Security → "
+                    "Automation, then try again.")
+        subprocess.run(["open", "-b", bundle_id, *([url] if url else [])])
+        if "-1719" in err or "assistive" in err.lower():
+            return (f"Opened in {name}, but placing its window needs Accessibility access "
+                    "(System Settings → Privacy & Security → Accessibility).")
+        return f"Opened in {name}, but couldn't place the window: {err}"
