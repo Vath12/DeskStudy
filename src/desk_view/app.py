@@ -9,14 +9,15 @@ from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QDoubleValidator, QFont, QImage, QPainter
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QDoubleSpinBox, QMainWindow, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
-    QWidget,
+    QDoubleSpinBox, QMainWindow, QProgressBar, QPushButton, QRadioButton, QSizePolicy, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from .board import BoardDetector, BoardSpec
 from .calibrate import DeskStep, Intrinsics, LensStep, build_calibration, summary
 from .camera import CameraError, list_cameras, open_camera
 from .geometry import CONFIG_DIR, Calibration, build_maps, calibration_path, fit_viewport, wrap_degrees
+from .web import WebPane  # imports QtWebEngine, which must happen before QApplication exists
 
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 OUTPUT_SIZE = (1280, 720)
@@ -134,7 +135,7 @@ class MainWindow(QMainWindow):
         self.panel_buttons: dict[str, QPushButton] = {}
 
         self.setWindowTitle("Desk View")
-        self.resize(1200, 860)
+        self.resize(1700, 900)
         self._build_ui()
 
         self._save_timer = QTimer(self, singleShot=True, interval=800)
@@ -156,11 +157,20 @@ class MainWindow(QMainWindow):
     # --- layout ---------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        root = QVBoxLayout(central)
-        root.setContentsMargins(12, 10, 12, 6)
+        # Web page on the left, desk view on the right; drag the divider to resize either.
+        self.web = WebPane(self.settings.get("web_url"), on_url_changed=self._remember_url)
+        desk = QWidget()
+        root = QVBoxLayout(desk)
+        root.setContentsMargins(6, 10, 12, 6)
         root.setSpacing(8)
-        self.setCentralWidget(central)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.web)
+        self.splitter.addWidget(desk)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        sizes = self.settings.get("splitter")
+        self.splitter.setSizes(sizes if isinstance(sizes, list) and len(sizes) == 2 else [760, 940])
+        self.setCentralWidget(self.splitter)
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Camera"))
@@ -182,7 +192,9 @@ class MainWindow(QMainWindow):
         self.calibrate_btn.clicked.connect(self.start_calibration)
         bar.addWidget(self.calibrate_btn)
         bar.addStretch(1)
+        root.addLayout(bar)
 
+        bar = QHBoxLayout()  # second row: view controls
         self.desk_radio = QRadioButton("Desk")
         self.camera_radio = QRadioButton("Camera")
         self.view_group = QButtonGroup(self)
@@ -217,6 +229,7 @@ class MainWindow(QMainWindow):
         self.vcam_check.toggled.connect(self.toggle_vcam)
         for w in (self.rotate_btn, self.mirror_check, self.vcam_check):
             bar.addWidget(w)
+        bar.addStretch(1)
         root.addLayout(bar)
 
         # Calibration / onboarding panel, shown only when needed.
@@ -551,6 +564,9 @@ class MainWindow(QMainWindow):
 
     # --- persistence ----------------------------------------------------------------
 
+    def _remember_url(self, url: str) -> None:
+        self.settings["web_url"] = url
+
     def _save_settings(self) -> None:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(self.settings, indent=2) + "\n")
@@ -600,6 +616,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._tick.stop()
+        self.settings["splitter"] = self.splitter.sizes()
+        self._save_settings()
+        self.web.shutdown()
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._save_calibration()

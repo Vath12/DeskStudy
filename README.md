@@ -75,6 +75,21 @@ Calibrations are stored per camera in `~/.config/desk_view/cameras/`.
 
 View changes are saved automatically.
 
+### Web page
+
+The left side of the window is a full browser (Chromium, via Qt WebEngine), so you can
+keep ChatGPT or docs open next to the desk view. Type in the address bar:
+
+- a name such as `chatgpt`, `claude` or `gemini` opens that site. Any other single word
+  opens `word.com`;
+- a domain or full URL opens it, and anything with spaces is a Google search.
+
+Logins persist between runs (stored in `~/.config/desk_view/web/`), sign-in popups open in
+their own window, and downloads go to `~/Downloads`. Sites must ask before using the camera,
+microphone, location or notifications. Drag the divider to resize or hide the page. The last
+page and divider position are remembered. The code is in
+[`src/desk_view/web/`](src/desk_view/web/).
+
 ### Use in video calls
 
 ```sh
