@@ -33,8 +33,8 @@ LENS_HELP = ("Hold the chart flat (tape it to cardboard) and move it around the 
              "into every corner, tilted left, right, up and down. Detected squares turn red, views are "
              "captured automatically, and green shows the parts of the image covered so far.")
 DESK_HELP = ("Lay the chart flat on the desk, in the middle of the area you want to show, and keep "
-             "your hands clear. Any rotation works. It locks in by itself once the chart is still; "
-             "Lock in forces it.")
+             "your hands clear. The chart's top edge (with the printed title) becomes the top of the view. "
+             "It locks in by itself once the chart is still; Lock in forces it.")
 UNCALIBRATED_HELP = ("Run ./generate_calibration_charts.sh and print a chart from the calibration_chart "
                      "folder at 100% scale, measure one black square, enter its size above, then calibrate.")
 
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
         self.rotation_spin.setSuffix("°")
         self.rotation_spin.setFixedWidth(84)
         self.rotation_spin.setToolTip("Turns the desk view clockwise to choose which way is up.\n"
-                                      "0° = level with the camera. Shift+drag or [ ] on the view also rotate.")
+                                      "0° = the chart's top edge up, as it lay during calibration. Shift+drag or [ ] on the view also rotate.")
         self.rotation_spin.setKeyboardTracking(False)  # apply on Enter / arrows, not every keystroke
         self.rotation_spin.valueChanged.connect(self.set_rotation)
         bar.addWidget(self.rotation_spin)

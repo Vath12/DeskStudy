@@ -27,9 +27,9 @@ class Viewport:
     """A rectangle on the desk, in board millimetres, that becomes the output image.
 
     `angle_deg` is the direction (in the board plane) that appears at the top of the
-    output before any user rotation; calibration aligns it with the camera, so the view is
-    level with the screen. `rotation_deg` is the user's rotation on top of that, clockwise
-    as seen in the output (also when mirrored).
+    output before any user rotation; calibration points it at the chart's top edge, so the
+    view comes out in the chart's orientation. `rotation_deg` is the user's rotation on top
+    of that, clockwise as seen in the output (also when mirrored).
     """
 
     center: tuple[float, float]
@@ -77,6 +77,10 @@ class Viewport:
         return np.array(pts)
 
 
+# The printed chart's top edge (its title) is at board y = 0, so "up" is board -y.
+CHART_UP_DEG = -90.0
+
+
 @dataclass
 class Calibration:
     image_size: tuple[int, int]
@@ -99,14 +103,71 @@ class Calibration:
         """Camera centre in board coordinates (mm)."""
         return (-self.rotation.T @ self.tvec.reshape(3)).ravel()
 
+    def distortion_limit(self) -> float:
+        """Normalised image radius beyond which the lens model is extrapolated, not trusted.
+
+        The distortion polynomial is only fitted where the chart was seen; past that it
+        often bends back or explodes, which would fold or throw away the edge of the frame.
+        The limit is the furthest radius the lens step saw (if recorded), and never past the
+        point where the distorted radius stops growing.
+        """
+        k1, k2, p1, p2, k3 = (list(self.dist_coeffs.ravel()) + [0.0] * 5)[:5]
+        r = np.linspace(0.0, 3.0, 3001)[1:]
+        r2 = r * r
+        slope = 1 + 3 * k1 * r2 + 5 * k2 * r2**2 + 7 * k3 * r2**3
+        seen = self.stats.get("lens_max_radius")
+        if not seen:  # older calibrations: also stop where the lens would be implausibly strong
+            radial = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+            slope = np.where(np.abs(radial - 1) > 0.5, 0.0, slope)
+        bad = np.nonzero(slope <= 0.05)[0]
+        limit = float(r[bad[0] - 1]) if len(bad) and bad[0] > 0 else float(r[-1])
+        return min(limit, seen) if seen else limit
+
+    def distort(self, xy: np.ndarray) -> np.ndarray:
+        """Apply lens distortion to normalised points (N, 2).
+
+        OpenCV's model inside `distortion_limit()`; outside it the distorted radius keeps
+        growing linearly with the slope it has at the limit, so the whole frame stays
+        mapped (stretched, but continuous) instead of folding or blowing up.
+        """
+        k1, k2, p1, p2, k3 = (list(self.dist_coeffs.ravel()) + [0.0] * 5)[:5]
+        if not any((k1, k2, p1, p2, k3)):
+            return xy
+        r = np.linalg.norm(xy, axis=1)
+        lim = self.distortion_limit()
+        scale = np.where(r > lim, lim / np.maximum(r, 1e-12), 1.0)
+        x, y = xy[:, 0] * scale, xy[:, 1] * scale  # points beyond the limit are pulled onto it
+        r2 = x * x + y * y
+        radial = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+        out = np.column_stack([
+            x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x),
+            y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y,
+        ])
+        beyond = r > lim
+        if beyond.any():
+            l2 = lim * lim
+            radial_lim = 1 + k1 * l2 + k2 * l2**2 + k3 * l2**3
+            slope = 1 + 3 * k1 * l2 + 5 * k2 * l2**2 + 7 * k3 * l2**3
+            # Never flatter than a fraction of the average magnification, so the extrapolated
+            # ring isn't squashed into a thin band.
+            slope = max(slope, 0.25 * radial_lim)
+            direction = xy[beyond] / r[beyond, None]
+            out[beyond] += (slope * (r[beyond] - lim))[:, None] * direction
+        return out
+
     def project_desk(self, desk_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Project desk points (..., 2) into the image. Returns (pixels, in_front_mask)."""
         shape = desk_xy.shape[:-1]
         pts = np.zeros((int(np.prod(shape)), 3), np.float64)
         pts[:, :2] = desk_xy.reshape(-1, 2)
-        cam_z = (pts @ self.rotation.T + self.tvec.reshape(1, 3))[:, 2]
-        img, _ = cv2.projectPoints(pts, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
-        return img.reshape(*shape, 2), (cam_z > 1e-6).reshape(shape)
+        cam = pts @ self.rotation.T + self.tvec.reshape(1, 3)
+        in_front = cam[:, 2] > 1e-6
+        with np.errstate(divide="ignore", invalid="ignore"):
+            norm = cam[:, :2] / np.where(in_front, cam[:, 2], 1.0)[:, None]
+        d = self.distort(norm)
+        K = self.camera_matrix
+        img = np.column_stack([K[0, 0] * d[:, 0] + K[0, 1] * d[:, 1] + K[0, 2], K[1, 1] * d[:, 1] + K[1, 2]])
+        return img.reshape(*shape, 2), in_front.reshape(shape)
 
     def image_to_desk(self, pixels: np.ndarray) -> np.ndarray:
         """Back-project image points (N, 2) onto the desk plane, returning (N, 2) mm."""
@@ -149,15 +210,6 @@ class Calibration:
             "viewport": Viewport(tuple(np.asarray(vp.center) * s), vp.width_mm * s, vp.angle_deg,
                                  vp.mirror, vp.rotation_deg),
         })
-
-    def default_angle(self) -> float:
-        """Viewport angle that keeps the view level with the camera (and so the screen).
-
-        The camera faces the user, so its image-right is the user's left: the output's
-        right axis is the camera's x axis, flipped, laid onto the desk.
-        """
-        right = -self.rotation[0, :2]
-        return math.degrees(math.atan2(-right[0], right[1]))
 
     # --- persistence ----------------------------------------------------------------
 

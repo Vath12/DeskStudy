@@ -43,6 +43,9 @@ scale slightly, so write down what you actually measure.
 ./run.sh
 ```
 
+The app starts in the background and writes its output to `.logs/desk-view.log`. Use
+`./run.sh -d` to keep it attached to the terminal instead.
+
 The first time, macOS asks whether your terminal app may use the camera. Allow it. If you
 missed the prompt, enable it in **System Settings → Privacy & Security → Camera** and
 start the app again.
@@ -56,7 +59,9 @@ start the app again.
      of the camera: near, far, into every corner, tilted in each direction. Views are
      captured automatically. You can skip this step, but the view is less accurate without it.
    - **Desk:** lay the chart flat on the desk, in the middle of the area you want to see,
-     keep your hands clear and hold still. It locks in by itself.
+     keep your hands clear and hold still. It locks in by itself. The chart's top edge (the
+     side with the printed title) becomes the top of the view, so lay it the way you want
+     the view to face.
 
 Calibration is saved per camera. Redo the desk step whenever the camera or laptop moves:
 click **Calibrate…**, then **Reuse previous lens calibration**.

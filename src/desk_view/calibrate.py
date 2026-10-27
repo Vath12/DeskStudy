@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from .board import BoardDetector, Detection
-from .geometry import Calibration, Viewport, fit_viewport
+from .geometry import CHART_UP_DEG, Calibration, Viewport, fit_viewport
 
 SQUARE_COLOR = (40, 40, 230)  # BGR red
 MARKER_COLOR = (230, 120, 30)  # BGR blue
@@ -26,6 +26,7 @@ class Intrinsics:
     dist_coeffs: np.ndarray
     rms: float
     views: int
+    max_radius: float | None = None  # furthest normalised radius the chart reached
 
     @classmethod
     def from_calibration(cls, calib: Calibration | None) -> "Intrinsics | None":
@@ -33,7 +34,8 @@ class Intrinsics:
         if calib is None or calib.intrinsics_method != "multi-view":
             return None
         return cls(calib.camera_matrix, calib.dist_coeffs,
-                   calib.stats.get("intrinsics_rms_px", 0.0), calib.stats.get("intrinsics_views", 0))
+                   calib.stats.get("intrinsics_rms_px", 0.0), calib.stats.get("intrinsics_views", 0),
+                   calib.stats.get("lens_max_radius"))
 
 
 @dataclass
@@ -173,8 +175,27 @@ class LensStep:
         return solve_intrinsics(self.obj_pts, self.img_pts, self.size)
 
 
+# Square pixels, no tangential term and no r^6 term: the extra freedom mostly fits noise
+# and makes the model explode just outside the area the chart covered.
+LENS_FLAGS = cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3
+# A principal point further than this (fraction of the image size) from the centre is almost
+# always a sign the views didn't constrain it (narrow lenses), so it is then fixed at the centre.
+MAX_PRINCIPAL_OFFSET = 0.12
+
+
+def _calibrate(obj_pts, img_pts, size):
+    w, h = size
+    K0 = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], np.float64)
+    flags = LENS_FLAGS | cv2.CALIB_USE_INTRINSIC_GUESS
+    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(obj_pts, img_pts, size, K0.copy(), None, flags=flags)
+    if abs(K[0, 2] - w / 2) > MAX_PRINCIPAL_OFFSET * w or abs(K[1, 2] - h / 2) > MAX_PRINCIPAL_OFFSET * h:
+        rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+            obj_pts, img_pts, size, K0.copy(), None, flags=flags | cv2.CALIB_FIX_PRINCIPAL_POINT)
+    return rms, K, dist, rvecs, tvecs
+
+
 def solve_intrinsics(obj_pts, img_pts, size) -> Intrinsics:
-    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(obj_pts, img_pts, size, None, None)
+    rms, K, dist, rvecs, tvecs = _calibrate(obj_pts, img_pts, size)
     # Drop views that disagree with the rest (motion blur, a bent chart...) and re-solve.
     errs = []
     for o, i, r, t in zip(obj_pts, img_pts, rvecs, tvecs):
@@ -185,8 +206,11 @@ def solve_intrinsics(obj_pts, img_pts, size) -> Intrinsics:
     if not keep.all() and keep.sum() >= 6:
         obj_pts = [o for o, k in zip(obj_pts, keep) if k]
         img_pts = [i for i, k in zip(img_pts, keep) if k]
-        rms, K, dist, _, _ = cv2.calibrateCamera(obj_pts, img_pts, size, None, None)
-    return Intrinsics(K, dist.ravel(), float(rms), len(obj_pts))
+        rms, K, dist, _, _ = _calibrate(obj_pts, img_pts, size)
+    # How far out the distortion was actually measured; beyond it the model is extrapolated.
+    norm = cv2.undistortPoints(np.concatenate(img_pts).reshape(-1, 1, 2).astype(np.float64), K, dist)
+    max_radius = float(np.linalg.norm(norm.reshape(-1, 2), axis=1).max())
+    return Intrinsics(K, dist.ravel(), float(rms), len(obj_pts), max_radius)
 
 
 # --- step 2: desk plane ---------------------------------------------------------------
@@ -346,10 +370,12 @@ def build_calibration(pose: DeskPose, detector: BoardDetector, size, out_size,
     )
     if intrinsics is not None:
         calib.stats.update(intrinsics_rms_px=round(intrinsics.rms, 3), intrinsics_views=intrinsics.views)
-    calib.viewport.angle_deg = calib.default_angle()
-    if old is not None:  # keep the user's orientation choices across recalibration
+        if intrinsics.max_radius:
+            calib.stats["lens_max_radius"] = round(intrinsics.max_radius, 4)
+    # The view takes the chart's orientation: its top edge (the printed title) is up.
+    calib.viewport.angle_deg = CHART_UP_DEG
+    if old is not None:  # keep the user's mirror choice across recalibration
         calib.viewport.mirror = old.viewport.mirror
-        calib.viewport.rotation_deg = old.viewport.rotation_deg
     center, width = fit_viewport(calib, spec.center_mm, spec.width_mm, out_size[0] / out_size[1], out_size[0])
     calib.viewport.center, calib.viewport.width_mm = center, width
     return calib
